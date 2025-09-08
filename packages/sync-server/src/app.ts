@@ -6,6 +6,11 @@ import cors from 'cors';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 
+// OpenTelemetry imports
+import { SpanStatusCode } from '@opentelemetry/api';
+import { SeverityNumber } from '@opentelemetry/api-logs';
+import { logger, tracer, meter } from './otel.js';
+
 import { bootstrap } from './account-db.js';
 import * as accountApp from './app-account.js';
 import * as adminApp from './app-admin.js';
@@ -19,8 +24,32 @@ import { config } from './load-config.js';
 
 const app = express();
 
+// Initialize metrics
+const httpRequestsTotal = meter.createCounter('http_requests_total', {
+  description: 'Total number of HTTP requests',
+});
+
+const httpRequestDuration = meter.createHistogram('http_request_duration_seconds', {
+  description: 'Duration of HTTP requests in seconds',
+});
+
+const serverStartTime = meter.createGauge('server_start_time_seconds', {
+  description: 'Unix timestamp when the server started',
+});
+
+// Metrics are defined in otel.ts and imported where needed
+
+// Record server start time
+serverStartTime.record(Date.now() / 1000);
+
 process.on('unhandledRejection', reason => {
   console.log('Rejection:', reason);
+  logger.emit({
+    severityNumber: SeverityNumber.ERROR,
+    severityText: 'ERROR',
+    body: 'Unhandled promise rejection',
+    attributes: { reason: String(reason) },
+  });
 });
 
 app.disable('x-powered-by');
@@ -36,6 +65,45 @@ if (process.env.NODE_ENV !== 'development') {
     }),
   );
 }
+
+// Add request tracking middleware
+app.use((req, res, next) => {
+  const startTime = Date.now();
+
+  res.on('finish', () => {
+    const duration = (Date.now() - startTime) / 1000;
+    const statusCode = res.statusCode.toString();
+
+    // Record metrics
+    httpRequestsTotal.add(1, {
+      method: req.method,
+      route: req.route?.path || req.path,
+      status_code: statusCode,
+    });
+
+    httpRequestDuration.record(duration, {
+      method: req.method,
+      route: req.route?.path || req.path,
+      status_code: statusCode,
+    });
+
+    // Log request
+    logger.emit({
+      severityNumber: res.statusCode >= 400 ? SeverityNumber.WARN : SeverityNumber.INFO,
+      severityText: res.statusCode >= 400 ? 'WARN' : 'INFO',
+      body: `${req.method} ${req.path} ${res.statusCode}`,
+      attributes: {
+        method: req.method,
+        path: req.path,
+        status_code: res.statusCode,
+        duration_ms: Date.now() - startTime,
+        user_agent: req.get('User-Agent') || '',
+      },
+    });
+  });
+
+  next();
+});
 
 app.use(express.json({ limit: `${config.get('upload.fileSizeLimitMB')}mb` }));
 
@@ -113,9 +181,37 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/metrics', (_req, res) => {
+  const memUsage = process.memoryUsage();
+  const uptime = process.uptime();
+
   res.status(200).json({
-    mem: process.memoryUsage(),
-    uptime: process.uptime(),
+    // System metrics
+    memory: {
+      rss: memUsage.rss,
+      heapTotal: memUsage.heapTotal,
+      heapUsed: memUsage.heapUsed,
+      external: memUsage.external,
+      arrayBuffers: memUsage.arrayBuffers,
+    },
+    uptime: uptime,
+
+    // Process metrics
+    process: {
+      pid: process.pid,
+      version: process.version,
+      platform: process.platform,
+      arch: process.arch,
+    },
+
+    // OpenTelemetry info
+    telemetry: {
+      service_name: 'actual-sync-server',
+      service_version: process.env.npm_package_version || '25.9.0',
+      instrumentation: 'opentelemetry',
+    },
+
+    // Timestamp
+    timestamp: new Date().toISOString(),
   });
 });
 
@@ -166,9 +262,17 @@ function sendServerStartedMessage() {
 }
 
 export async function run() {
-  const portVal = config.get('port');
-  const port = typeof portVal === 'string' ? parseInt(portVal) : portVal;
-  const hostname = config.get('hostname');
+  const span = tracer.startSpan('server.start');
+
+  try {
+    const portVal = config.get('port');
+    const port = typeof portVal === 'string' ? parseInt(portVal) : portVal;
+    const hostname = config.get('hostname');
+
+    span.setAttributes({
+      'server.port': port,
+      'server.hostname': hostname,
+    });
   const openIdConfig = config?.getProperties()?.openId;
   if (
     openIdConfig?.discoveryURL ||
@@ -197,10 +301,25 @@ export async function run() {
     };
     https.createServer(httpsOptions, app).listen(port, hostname, () => {
       sendServerStartedMessage();
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
     });
   } else {
     app.listen(port, hostname, () => {
       sendServerStartedMessage();
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
     });
+  }
+  } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
+    span.end();
+    logger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: 'Error starting server',
+      attributes: { error: (error as Error).message },
+    });
+    throw error;
   }
 }

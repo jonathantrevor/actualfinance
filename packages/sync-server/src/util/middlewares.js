@@ -1,5 +1,6 @@
 import * as expressWinston from 'express-winston';
 import * as winston from 'winston';
+import { trace } from '@opentelemetry/api';
 
 import { validateSession } from './validate-user.js';
 
@@ -23,9 +24,19 @@ async function errorMiddleware(err, req, res, next) {
     return next(err);
   }
 
-  console.log(`Error on endpoint %s`, {
+  // Get trace context for correlation
+  const activeSpan = trace.getActiveSpan();
+  const traceId = activeSpan?.spanContext().traceId || '';
+  const spanId = activeSpan?.spanContext().spanId || '';
+
+  const traceInfo = traceId ? ` [trace_id=${traceId} span_id=${spanId}]` : '';
+
+  console.log(`Error on endpoint ${req.url}${traceInfo}`, {
     requestUrl: req.url,
     stacktrace: err.stack,
+    trace_id: traceId,
+    span_id: spanId,
+    user_id: res.locals?.user_id || '',
   });
   res.status(500).send({ status: 'error', reason: 'internal-error' });
 }
@@ -56,9 +67,25 @@ const requestLoggerMiddleware = expressWinston.logger({
       const { timestamp, level, meta } = args;
       const { res, req } = meta;
 
-      return `${timestamp} ${level}: ${req.method} ${res.statusCode} ${req.url}`;
+      // Get trace context for correlation
+      const activeSpan = trace.getActiveSpan();
+      const traceId = activeSpan?.spanContext().traceId || '';
+      const spanId = activeSpan?.spanContext().spanId || '';
+
+      const traceInfo = traceId ? ` [trace_id=${traceId} span_id=${spanId}]` : '';
+
+      return `${timestamp} ${level}: ${req.method} ${res.statusCode} ${req.url}${traceInfo}`;
     }),
   ),
+  // Add trace correlation to metadata
+  dynamicMeta: (req, res) => {
+    const activeSpan = trace.getActiveSpan();
+    return {
+      trace_id: activeSpan?.spanContext().traceId || '',
+      span_id: activeSpan?.spanContext().spanId || '',
+      user_id: res.locals?.user_id || '',
+    };
+  },
 });
 
 export { validateSessionMiddleware, errorMiddleware, requestLoggerMiddleware };
