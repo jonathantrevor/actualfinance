@@ -9,9 +9,17 @@ import {
   BatchLogRecordProcessor,
   LoggerProvider,
 } from '@opentelemetry/sdk-logs';
-import { PeriodicExportingMetricReader } from '@opentelemetry/sdk-metrics';
-import { NodeSDK } from '@opentelemetry/sdk-node';
-import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
+import {
+  ConsoleMetricExporter,
+  PeriodicExportingMetricReader,
+} from '@opentelemetry/sdk-metrics';
+import { NodeSDK, tracing } from '@opentelemetry/sdk-node';
+import {
+  ATTR_SERVICE_NAME,
+  ATTR_SERVICE_VERSION,
+} from '@opentelemetry/semantic-conventions';
+
+const { ConsoleSpanExporter, BatchSpanProcessor } = tracing;
 
 // Configuration
 const serviceName = 'actual-sync-server';
@@ -31,31 +39,49 @@ const resource = resourceFromAttributes({
   [ATTR_SERVICE_VERSION]: serviceVersion,
 });
 
-// Initialize OpenTelemetry SDK
+// Create exporters
+const otlpTraceExporter = new OTLPTraceExporter({
+  url: `${otlpEndpoint}/v1/traces`,
+  headers: {
+    ...authHeader,
+    'x-observe-target-package': 'Tracing',
+  },
+});
+
+const consoleTraceExporter = new ConsoleSpanExporter();
+
+const otlpMetricExporter = new OTLPMetricExporter({
+  url: `${otlpEndpoint}/v1/metrics`,
+  headers: {
+    ...authHeader,
+    'x-observe-target-package': 'Metrics',
+  },
+});
+
+const consoleMetricExporter = new ConsoleMetricExporter();
+
+// Initialize OpenTelemetry SDK with multiple exporters
 export const sdk = new NodeSDK({
-  resource: resource,
-  traceExporter: new OTLPTraceExporter({
-    url: `${otlpEndpoint}/v1/traces`,
-    headers: {
-      ...authHeader,
-      'x-observe-target-package': 'Tracing',
-    },
-  }),
+  resource,
+  spanProcessors: [
+    new BatchSpanProcessor(otlpTraceExporter),
+    new BatchSpanProcessor(consoleTraceExporter),
+  ],
   metricReader: new PeriodicExportingMetricReader({
-    exporter: new OTLPMetricExporter({
-      url: `${otlpEndpoint}/v1/metrics`,
-      headers: {
-        ...authHeader,
-        'x-observe-target-package': 'Metrics',
-      },
-    }),
+    exporter: otlpMetricExporter,
   }),
   instrumentations: [getNodeAutoInstrumentations()],
 });
 
+// Additional console metric reader for real-time terminal output
+export const consoleMetricReader = new PeriodicExportingMetricReader({
+  exporter: consoleMetricExporter,
+  exportIntervalMillis: 5000, // Export every 5 seconds for real-time visibility
+});
+
 // Initialize Logger Provider
 const loggerProvider = new LoggerProvider({
-  resource: resource,
+  resource,
   processors: [
     new BatchLogRecordProcessor(
       new OTLPLogExporter({
@@ -64,7 +90,7 @@ const loggerProvider = new LoggerProvider({
           ...authHeader,
           'x-observe-target-package': 'Logs',
         },
-      })
+      }),
     ),
   ],
 });
@@ -77,13 +103,19 @@ export const tracer = trace.getTracer(serviceName, serviceVersion);
 export const meter = metrics.getMeter(serviceName, serviceVersion);
 
 // Export common metrics for use across the application
-export const syncOperationsTotal = meter.createCounter('sync_operations_total', {
-  description: 'Total number of sync operations',
-});
+export const syncOperationsTotal = meter.createCounter(
+  'sync_operations_total',
+  {
+    description: 'Total number of sync operations',
+  },
+);
 
-export const fileOperationsTotal = meter.createCounter('file_operations_total', {
-  description: 'Total number of file operations',
-});
+export const fileOperationsTotal = meter.createCounter(
+  'file_operations_total',
+  {
+    description: 'Total number of file operations',
+  },
+);
 
 export const errorRateTotal = meter.createCounter('errors_total', {
   description: 'Total number of errors by type',
@@ -98,14 +130,21 @@ export function initOtel() {
     logger.emit({
       severityNumber: SeverityNumber.INFO,
       severityText: 'INFO',
-      body: 'OpenTelemetry SDK started for Actual Budget sync server',
+      body: 'OpenTelemetry SDK started for Actual Budget sync server with console exporters',
       attributes: {
         service: serviceName,
         version: serviceVersion,
       },
     });
 
-    console.log('OpenTelemetry initialized successfully');
+    console.log(
+      'OpenTelemetry initialized successfully with console exporters for real-time output',
+    );
+    console.log('- Traces: Exported to both OTLP and console');
+    console.log(
+      '- Metrics: Exported to OTLP (console metrics require separate meter provider setup)',
+    );
+    console.log('- Logs: Exported to OTLP');
   } catch (error) {
     console.error('Error starting OpenTelemetry SDK:', error);
     logger.emit({
@@ -118,10 +157,55 @@ export function initOtel() {
   }
 }
 
+// Utility function to log with OpenTelemetry trace context
+export function logWithTraceContext(
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  data?: unknown,
+) {
+  const activeSpan = trace.getActiveSpan();
+  const spanContext = activeSpan?.spanContext();
+
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    level: level.toUpperCase(),
+    message,
+    ...(data && { data }),
+    ...(spanContext && {
+      traceId: spanContext.traceId,
+      spanId: spanContext.spanId,
+      traceFlags: spanContext.traceFlags,
+    }),
+  };
+
+  console.log(JSON.stringify(logEntry, null, 2));
+
+  // Also emit to OpenTelemetry logger
+  const severityMap = {
+    info: SeverityNumber.INFO,
+    warn: SeverityNumber.WARN,
+    error: SeverityNumber.ERROR,
+  };
+
+  logger.emit({
+    severityNumber: severityMap[level],
+    severityText: level.toUpperCase(),
+    body: message,
+    attributes: {
+      ...(data && { data: JSON.stringify(data) }),
+      ...(spanContext && {
+        traceId: spanContext.traceId,
+        spanId: spanContext.spanId,
+      }),
+    },
+  });
+}
+
 // Graceful shutdown
 export function shutdownOtel(): void {
   try {
     sdk.shutdown();
+    consoleMetricReader.shutdown();
     console.log('OpenTelemetry SDK shutdown successfully');
   } catch (error) {
     console.error('Error shutting down OpenTelemetry SDK:', error);
