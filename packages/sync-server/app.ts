@@ -1,3 +1,9 @@
+// Initialize OpenTelemetry FIRST before any other imports
+import { initOtel, shutdownOtel } from './src/otel.js';
+
+// Initialize OpenTelemetry
+initOtel();
+
 import { run as runMigrations } from './src/migrations.js';
 
 runMigrations()
@@ -9,3 +15,16 @@ runMigrations()
     console.log('Error starting app:', err);
     process.exit(1);
   });
+
+// Graceful shutdown handlers
+process.on('SIGTERM', () => {
+  console.log('Received SIGTERM, shutting down gracefully');
+  shutdownOtel();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('Received SIGINT, shutting down gracefully');
+  shutdownOtel();
+  process.exit(0);
+});

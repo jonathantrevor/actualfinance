@@ -6,6 +6,11 @@ import { SyncProtoBuf } from '@actual-app/crdt';
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 
+// OpenTelemetry imports
+import { SpanStatusCode } from '@opentelemetry/api';
+import { SeverityNumber } from '@opentelemetry/api-logs';
+import { logger, tracer, syncOperationsTotal, fileOperationsTotal, errorRateTotal } from './otel.js';
+
 import { getAccountDb } from './account-db.js';
 import { FileNotFound } from './app-sync/errors.js';
 import {
@@ -57,15 +62,29 @@ const verifyFileExists = (fileId, filesService, res, errorObject) => {
 };
 
 app.post('/sync', async (req, res): Promise<void> => {
-  let requestPb;
+  const span = tracer.startSpan('sync.request');
+
   try {
-    requestPb = SyncProtoBuf.SyncRequest.deserializeBinary(req.body);
-  } catch (e) {
-    console.log('Error parsing sync request', e);
-    res.status(500);
-    res.send({ status: 'error', reason: 'internal-error' });
-    return;
-  }
+    let requestPb;
+    try {
+      requestPb = SyncProtoBuf.SyncRequest.deserializeBinary(req.body);
+      span.setAttributes({
+        'sync.request.size': req.body.length,
+        'sync.user_id': res.locals.user_id,
+      });
+    } catch (e) {
+      console.log('Error parsing sync request', e);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'Failed to parse sync request' });
+      logger.emit({
+        severityNumber: SeverityNumber.ERROR,
+        severityText: 'ERROR',
+        body: 'Error parsing sync request',
+        attributes: { error: String(e), user_id: res.locals.user_id },
+      });
+      res.status(500);
+      res.send({ status: 'error', reason: 'internal-error' });
+      return;
+    }
 
   const fileId = requestPb.getFileid() || null;
   const groupId = requestPb.getGroupid() || null;
@@ -102,16 +121,54 @@ app.post('/sync', async (req, res): Promise<void> => {
     return;
   }
 
-  const { trie, newMessages } = simpleSync.sync(messages, since, groupId);
+    const { trie, newMessages } = simpleSync.sync(messages, since, groupId);
 
-  // encode it back...
-  const responsePb = new SyncProtoBuf.SyncResponse();
-  responsePb.setMerkle(JSON.stringify(trie));
-  newMessages.forEach(msg => responsePb.addMessages(msg));
+    // encode it back...
+    const responsePb = new SyncProtoBuf.SyncResponse();
+    responsePb.setMerkle(JSON.stringify(trie));
+    newMessages.forEach(msg => responsePb.addMessages(msg));
 
-  res.set('Content-Type', 'application/actual-sync');
-  res.set('X-ACTUAL-SYNC-METHOD', 'simple');
-  res.send(Buffer.from(responsePb.serializeBinary()));
+    span.setAttributes({
+      'sync.response.messages_count': newMessages.length,
+      'sync.response.size': responsePb.serializeBinary().length,
+    });
+
+    // Record metrics
+    syncOperationsTotal.add(1, {
+      status: 'success',
+      user_id: res.locals.user_id,
+    });
+
+    res.set('Content-Type', 'application/actual-sync');
+    res.set('X-ACTUAL-SYNC-METHOD', 'simple');
+    res.send(Buffer.from(responsePb.serializeBinary()));
+
+    span.setStatus({ code: SpanStatusCode.OK });
+    span.end();
+  } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
+    span.end();
+
+    // Record error metrics
+    syncOperationsTotal.add(1, {
+      status: 'error',
+      user_id: res.locals.user_id,
+    });
+
+    errorRateTotal.add(1, {
+      operation: 'sync',
+      error_type: (error as Error).name || 'unknown',
+    });
+
+    logger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: 'Error in sync operation',
+      attributes: { error: (error as Error).message, user_id: res.locals.user_id },
+    });
+
+    throw error;
+  }
 });
 
 app.post('/user-get-key', (req, res) => {
@@ -188,15 +245,26 @@ app.post('/reset-user-file', async (req, res) => {
 });
 
 app.post('/upload-user-file', async (req, res) => {
-  if (typeof req.headers['x-actual-name'] !== 'string') {
-    // FIXME: Not sure how this cannot be a string when the header is
-    // set.
-    res.status(400).send('single x-actual-name is required');
-    return;
-  }
+  const span = tracer.startSpan('file.upload');
 
-  const name = decodeURIComponent(req.headers['x-actual-name']);
-  const fileId = req.headers['x-actual-file-id'];
+  try {
+    if (typeof req.headers['x-actual-name'] !== 'string') {
+      // FIXME: Not sure how this cannot be a string when the header is
+      // set.
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'Missing x-actual-name header' });
+      res.status(400).send('single x-actual-name is required');
+      return;
+    }
+
+    const name = decodeURIComponent(req.headers['x-actual-name']);
+    const fileId = req.headers['x-actual-file-id'];
+
+    span.setAttributes({
+      'file.name': name,
+      'file.id': fileId || 'new',
+      'file.size': req.body.length,
+      'user.id': res.locals.user_id,
+    });
 
   if (!fileId || typeof fileId !== 'string') {
     res.status(400).send('fileId is required');
@@ -268,17 +336,56 @@ app.post('/upload-user-file', async (req, res) => {
     filesService.update(fileId, new FileUpdate({ groupId }));
   }
 
-  // Regardless, update some properties
-  filesService.update(
-    fileId,
-    new FileUpdate({
-      syncVersion: syncFormatVersion,
-      encryptMeta,
-      name,
-    }),
-  );
+    // Regardless, update some properties
+    filesService.update(
+      fileId,
+      new FileUpdate({
+        syncVersion: syncFormatVersion,
+        encryptMeta,
+        name,
+      }),
+    );
 
-  res.send({ status: 'ok', groupId });
+    span.setAttributes({
+      'file.group_id': groupId,
+      'file.sync_version': syncFormatVersion,
+    });
+
+    // Record metrics
+    fileOperationsTotal.add(1, {
+      operation: 'upload',
+      status: 'success',
+      user_id: res.locals.user_id,
+    });
+
+    res.send({ status: 'ok', groupId });
+    span.setStatus({ code: SpanStatusCode.OK });
+    span.end();
+  } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
+    span.end();
+
+    // Record error metrics
+    fileOperationsTotal.add(1, {
+      operation: 'upload',
+      status: 'error',
+      user_id: res.locals.user_id,
+    });
+
+    errorRateTotal.add(1, {
+      operation: 'file_upload',
+      error_type: (error as Error).name || 'unknown',
+    });
+
+    logger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: 'Error uploading user file',
+      attributes: { error: (error as Error).message, user_id: res.locals.user_id },
+    });
+
+    throw error;
+  }
 });
 
 app.get('/download-user-file', async (req, res) => {
