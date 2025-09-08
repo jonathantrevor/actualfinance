@@ -1,11 +1,18 @@
 // @ts-strict-ignore
 // This file will initialize the app if we are in a real browser
 // environment (not electron)
+
+// Initialize OpenTelemetry FIRST before any other imports
+import { initOtel } from './otel-client';
+
 import './browser-preload';
 
 import './fonts.scss';
 
 import './i18n';
+// See https://github.com/WICG/focus-visible. Only makes the blue
+// focus outline appear from keyboard events.
+import 'focus-visible';
 
 import React from 'react';
 import { Provider } from 'react-redux';
@@ -21,9 +28,6 @@ import * as appSlice from './app/appSlice';
 import { AuthProvider } from './auth/AuthProvider';
 import * as budgetSlice from './budget/budgetSlice';
 import * as budgetfilesSlice from './budgetfiles/budgetfilesSlice';
-// See https://github.com/WICG/focus-visible. Only makes the blue
-// focus outline appear from keyboard events.
-import 'focus-visible';
 import { App } from './components/App';
 import { ServerProvider } from './components/ServerContext';
 import * as modalsSlice from './modals/modalsSlice';
@@ -36,6 +40,9 @@ import * as tagsSlice from './tags/tagsSlice';
 import * as transactionsSlice from './transactions/transactionsSlice';
 import { redo, undo } from './undo';
 import * as usersSlice from './users/usersSlice';
+
+// Initialize OpenTelemetry
+initOtel();
 
 const boundActions = bindActionCreators(
   {
