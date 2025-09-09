@@ -6,6 +6,7 @@ import { bootstrapOpenId } from './accounts/openid.js';
 import { bootstrapPassword, loginWithPassword } from './accounts/password.js';
 import { openDatabase } from './db.js';
 import { config } from './load-config.js';
+import { userSignupsTotal, transactionEventsTotal } from './otel.js';
 
 let _accountDb;
 
@@ -125,6 +126,14 @@ export async function bootstrap(loginSettings, forced = false) {
     }
 
     accountDb.mutate('COMMIT');
+
+    // Track user signup/bootstrap completion
+    userSignupsTotal.add(1, {
+      user_type: 'bootstrap',
+      outcome: 'success',
+      login_method: passEnabled ? 'password' : openIdEnabled ? 'openid' : 'unknown',
+    });
+
     return passEnabled ? loginWithPassword(loginSettings.password) : {};
   } catch (error) {
     accountDb.mutate('ROLLBACK');

@@ -9,7 +9,7 @@ import { v4 as uuidv4 } from 'uuid';
 // OpenTelemetry imports
 import { SpanStatusCode } from '@opentelemetry/api';
 import { SeverityNumber } from '@opentelemetry/api-logs';
-import { logger, tracer, syncOperationsTotal, fileOperationsTotal, errorRateTotal } from './otel.js';
+import { logger, tracer, syncOperationsTotal, fileOperationsTotal, errorRateTotal, transactionEventsTotal } from './otel.js';
 
 import { getAccountDb } from './account-db.js';
 import { FileNotFound } from './app-sync/errors.js';
@@ -139,6 +139,13 @@ app.post('/sync', async (req, res): Promise<void> => {
       user_id: res.locals.user_id,
     });
 
+    // Track transaction events (sync operations can be considered business transactions)
+    transactionEventsTotal.add(1, {
+      outcome: 'success',
+      operation: 'sync',
+      user: res.locals.user_id,
+    });
+
     res.set('Content-Type', 'application/actual-sync');
     res.set('X-ACTUAL-SYNC-METHOD', 'simple');
     res.send(Buffer.from(responsePb.serializeBinary()));
@@ -158,6 +165,13 @@ app.post('/sync', async (req, res): Promise<void> => {
     errorRateTotal.add(1, {
       operation: 'sync',
       error_type: (error as Error).name || 'unknown',
+    });
+
+    // Track failed transaction events
+    transactionEventsTotal.add(1, {
+      outcome: 'failed',
+      operation: 'sync',
+      user: res.locals.user_id,
     });
 
     logger.emit({
