@@ -1,4 +1,4 @@
-import { trace, metrics } from '@opentelemetry/api';
+import { trace, metrics, SpanStatusCode } from '@opentelemetry/api';
 import { logs, SeverityNumber } from '@opentelemetry/api-logs';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-http';
@@ -121,11 +121,208 @@ export const errorRateTotal = meter.createCounter('errors_total', {
   description: 'Total number of errors by type',
 });
 
+// Business and Technical Metrics as per requirements
+
+// 1. Active users gauge (5-min window)
+export const activeUsersGauge = meter.createGauge('active_users_total', {
+  description: 'Number of unique users active in the last 5 minutes',
+});
+
+// 2. Business event counters
+export const transactionEventsTotal = meter.createCounter('transaction_events_total', {
+  description: 'Total number of transaction events (successful and failed)',
+});
+
+export const userSignupsTotal = meter.createCounter('user_signups_total', {
+  description: 'Total number of user signups and completed onboardings',
+});
+
+// 3. CPU usage gauge
+export const cpuUsageGauge = meter.createGauge('cpu_usage_percent', {
+  description: 'CPU usage percentage',
+});
+
+// 4. Queue length/backlog gauge (placeholder for async jobs)
+export const queueLengthGauge = meter.createGauge('queue_length_total', {
+  description: 'Number of items in async job queues',
+});
+
+// 5. Error rate histogram by type/location
+export const errorRateHistogram = meter.createHistogram('error_rate_by_type', {
+  description: 'Error rates and frequencies by type and location',
+});
+
+// 6. External API request metrics
+export const externalApiRequestDuration = meter.createHistogram('external_api_request_duration_seconds', {
+  description: 'Duration of external API requests in seconds',
+});
+
+export const externalApiErrorsTotal = meter.createCounter('external_api_errors_total', {
+  description: 'Total number of external API errors',
+});
+
+// 7. Cache hit/miss counters (placeholder)
+export const cacheHitsTotal = meter.createCounter('cache_hits_total', {
+  description: 'Total number of cache hits',
+});
+
+export const cacheMissesTotal = meter.createCounter('cache_misses_total', {
+  description: 'Total number of cache misses',
+});
+
+// 8. Database query metrics
+export const databaseQueryDuration = meter.createHistogram('database_query_duration_seconds', {
+  description: 'Duration of database queries in seconds',
+});
+
+export const databaseQueryErrorsTotal = meter.createCounter('database_query_errors_total', {
+  description: 'Total number of database query errors',
+});
+
+// Active users tracking (5-minute window)
+const activeUsers = new Set<string>();
+const userActivityTimestamps = new Map<string, number>();
+
+export function trackActiveUser(userId: string) {
+  const now = Date.now();
+  activeUsers.add(userId);
+  userActivityTimestamps.set(userId, now);
+
+  // Clean up users older than 5 minutes
+  const fiveMinutesAgo = now - 5 * 60 * 1000;
+  for (const [user, timestamp] of userActivityTimestamps.entries()) {
+    if (timestamp < fiveMinutesAgo) {
+      activeUsers.delete(user);
+      userActivityTimestamps.delete(user);
+    }
+  }
+
+  // Update gauge
+  activeUsersGauge.record(activeUsers.size);
+}
+
+// CPU usage tracking
+export function updateCpuUsage() {
+  try {
+    const usage = process.cpuUsage();
+    const totalUsage = usage.user + usage.system;
+    // Convert to percentage (approximate)
+    const cpuPercent = (totalUsage / 1000000) / process.uptime() * 100;
+    cpuUsageGauge.record(Math.min(cpuPercent, 100));
+  } catch (error) {
+    console.warn('Failed to update CPU usage:', error);
+  }
+}
+
+// Database query instrumentation helper
+export function instrumentDatabaseQuery<T>(
+  operation: string,
+  table: string,
+  queryFn: () => T
+): T {
+  const startTime = Date.now();
+  const span = tracer.startSpan(`db.${operation}`, {
+    attributes: {
+      'db.operation': operation,
+      'db.table': table,
+    },
+  });
+
+  try {
+    const result = queryFn();
+    const duration = (Date.now() - startTime) / 1000;
+
+    databaseQueryDuration.record(duration, {
+      operation,
+      table,
+      status: 'success',
+    });
+
+    span.setStatus({ code: SpanStatusCode.OK });
+    span.end();
+
+    return result;
+  } catch (error) {
+    const duration = (Date.now() - startTime) / 1000;
+
+    databaseQueryDuration.record(duration, {
+      operation,
+      table,
+      status: 'error',
+    });
+
+    databaseQueryErrorsTotal.add(1, {
+      operation,
+      table,
+      error_type: (error as Error).name || 'unknown',
+    });
+
+    span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
+    span.end();
+
+    throw error;
+  }
+}
+
+// External API instrumentation helper
+export function instrumentExternalApiCall<T>(
+  dependency: string,
+  operation: string,
+  apiFn: () => Promise<T>
+): Promise<T> {
+  const startTime = Date.now();
+  const span = tracer.startSpan(`external_api.${dependency}`, {
+    attributes: {
+      'external.dependency': dependency,
+      'external.operation': operation,
+    },
+  });
+
+  return apiFn()
+    .then((result) => {
+      const duration = (Date.now() - startTime) / 1000;
+
+      externalApiRequestDuration.record(duration, {
+        dependency,
+        operation,
+        status: 'success',
+      });
+
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+
+      return result;
+    })
+    .catch((error) => {
+      const duration = (Date.now() - startTime) / 1000;
+
+      externalApiRequestDuration.record(duration, {
+        dependency,
+        operation,
+        status: 'error',
+      });
+
+      externalApiErrorsTotal.add(1, {
+        dependency,
+        operation,
+        error_type: (error as Error).name || 'unknown',
+      });
+
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (error as Error).message });
+      span.end();
+
+      throw error;
+    });
+}
+
 // Initialize OpenTelemetry and return initialized components
 export function initOtel() {
   try {
     logs.setGlobalLoggerProvider(loggerProvider);
     sdk.start();
+
+    // Start periodic CPU monitoring
+    setInterval(updateCpuUsage, 10000); // Update every 10 seconds
 
     logger.emit({
       severityNumber: SeverityNumber.INFO,
@@ -145,6 +342,7 @@ export function initOtel() {
       '- Metrics: Exported to OTLP (console metrics require separate meter provider setup)',
     );
     console.log('- Logs: Exported to OTLP');
+    console.log('- CPU monitoring: Started with 10-second intervals');
   } catch (error) {
     console.error('Error starting OpenTelemetry SDK:', error);
     logger.emit({

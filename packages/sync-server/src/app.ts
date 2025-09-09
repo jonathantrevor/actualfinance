@@ -9,9 +9,9 @@ import rateLimit from 'express-rate-limit';
 // OpenTelemetry imports
 import { SpanStatusCode } from '@opentelemetry/api';
 import { SeverityNumber } from '@opentelemetry/api-logs';
-import { logger, tracer, meter } from './otel.js';
+import { logger, tracer, meter, trackActiveUser } from './otel.js';
 
-import { bootstrap } from './account-db.js';
+import { bootstrap, getAccountDb } from './account-db.js';
 import * as accountApp from './app-account.js';
 import * as adminApp from './app-admin.js';
 import * as goCardlessApp from './app-gocardless/app-gocardless.js';
@@ -41,6 +41,36 @@ const serverStartTime = meter.createGauge('server_start_time_seconds', {
 
 // Record server start time
 serverStartTime.record(Date.now() / 1000);
+
+// Health check functions
+async function checkDatabaseHealth() {
+  try {
+    const accountDb = getAccountDb();
+    // Simple query to check if database is accessible
+    accountDb.first('SELECT 1 as test');
+    return { status: 'UP', details: 'Database connection successful' };
+  } catch (error) {
+    return {
+      status: 'DOWN',
+      details: `Database connection failed: ${(error as Error).message}`
+    };
+  }
+}
+
+async function checkDependencyHealth() {
+  const dependencies = {
+    database: await checkDatabaseHealth(),
+    // Add more dependency checks here as needed
+  };
+
+  const allHealthy = Object.values(dependencies).every(dep => dep.status === 'UP');
+
+  return {
+    status: allHealthy ? 'READY' : 'NOT_READY',
+    dependencies,
+    timestamp: new Date().toISOString(),
+  };
+}
 
 process.on('unhandledRejection', reason => {
   console.log('Rejection:', reason);
@@ -74,17 +104,24 @@ app.use((req, res, next) => {
     const duration = (Date.now() - startTime) / 1000;
     const statusCode = res.statusCode.toString();
 
+    // Track active users if user_id is available
+    if (res.locals?.user_id) {
+      trackActiveUser(res.locals.user_id);
+    }
+
     // Record metrics
     httpRequestsTotal.add(1, {
       method: req.method,
       route: req.route?.path || req.path,
       status_code: statusCode,
+      user: res.locals?.user_id || 'anonymous',
     });
 
     httpRequestDuration.record(duration, {
       method: req.method,
       route: req.route?.path || req.path,
       status_code: statusCode,
+      user: res.locals?.user_id || 'anonymous',
     });
 
     // Log request
@@ -98,6 +135,7 @@ app.use((req, res, next) => {
         status_code: res.statusCode,
         duration_ms: Date.now() - startTime,
         user_agent: req.get('User-Agent') || '',
+        user_id: res.locals?.user_id || '',
       },
     });
   });
@@ -176,8 +214,43 @@ app.get('/info', (_req, res) => {
   });
 });
 
-app.get('/health', (_req, res) => {
+// Health check endpoints as per requirements
+
+// /live endpoint - returns {status: 'UP'} if process is running
+app.get('/live', (_req, res) => {
   res.status(200).json({ status: 'UP' });
+});
+
+// /ready endpoint - checks DB and critical dependencies
+app.get('/ready', async (_req, res) => {
+  try {
+    const healthCheck = await checkDependencyHealth();
+    const statusCode = healthCheck.status === 'READY' ? 200 : 503;
+    res.status(statusCode).json(healthCheck);
+  } catch (error) {
+    res.status(503).json({
+      status: 'NOT_READY',
+      error: (error as Error).message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Legacy health endpoint - enhanced with dependency information
+app.get('/health', async (_req, res) => {
+  try {
+    const healthCheck = await checkDependencyHealth();
+    res.status(200).json({
+      status: 'UP',
+      ...healthCheck,
+    });
+  } catch (error) {
+    res.status(200).json({
+      status: 'UP',
+      error: (error as Error).message,
+      timestamp: new Date().toISOString(),
+    });
+  }
 });
 
 app.get('/metrics', (_req, res) => {

@@ -4,6 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 
 import { SecretName, secretsService } from '../../services/secrets-service.js';
 import { BankFactory, BANKS_WITH_LIMITED_HISTORY } from '../bank-factory.js';
+import { instrumentExternalApiCall } from '../../otel.js';
 import {
   AccessDeniedError,
   AccountNotLinkedToRequisition,
@@ -596,25 +597,41 @@ export const goCardlessService = {
  */
 export const client = {
   getBalances: async accountId =>
-    await getGocardlessClient().account(accountId).getBalances(),
+    await instrumentExternalApiCall('gocardless', 'getBalances', () =>
+      getGocardlessClient().account(accountId).getBalances()
+    ),
   getTransactions: async ({ accountId, dateFrom, dateTo }) =>
-    await getGocardlessClient().account(accountId).getTransactions({
-      dateFrom,
-      dateTo,
-      country: undefined,
-    }),
+    await instrumentExternalApiCall('gocardless', 'getTransactions', () =>
+      getGocardlessClient().account(accountId).getTransactions({
+        dateFrom,
+        dateTo,
+        country: undefined,
+      })
+    ),
   getInstitutions: async country =>
-    await getGocardlessClient().institution.getInstitutions({ country }),
+    await instrumentExternalApiCall('gocardless', 'getInstitutions', () =>
+      getGocardlessClient().institution.getInstitutions({ country })
+    ),
   getInstitutionById: async institutionId =>
-    await getGocardlessClient().institution.getInstitutionById(institutionId),
+    await instrumentExternalApiCall('gocardless', 'getInstitutionById', () =>
+      getGocardlessClient().institution.getInstitutionById(institutionId)
+    ),
   getDetails: async accountId =>
-    await getGocardlessClient().account(accountId).getDetails(),
+    await instrumentExternalApiCall('gocardless', 'getDetails', () =>
+      getGocardlessClient().account(accountId).getDetails()
+    ),
   getMetadata: async accountId =>
-    await getGocardlessClient().account(accountId).getMetadata(),
+    await instrumentExternalApiCall('gocardless', 'getMetadata', () =>
+      getGocardlessClient().account(accountId).getMetadata()
+    ),
   getRequisitionById: async requisitionId =>
-    await getGocardlessClient().requisition.getRequisitionById(requisitionId),
+    await instrumentExternalApiCall('gocardless', 'getRequisitionById', () =>
+      getGocardlessClient().requisition.getRequisitionById(requisitionId)
+    ),
   deleteRequisition: async requisitionId =>
-    await getGocardlessClient().requisition.deleteRequisition(requisitionId),
+    await instrumentExternalApiCall('gocardless', 'deleteRequisition', () =>
+      getGocardlessClient().requisition.deleteRequisition(requisitionId)
+    ),
   initSession: async ({
     redirectUrl,
     institutionId,
