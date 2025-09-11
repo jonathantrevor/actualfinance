@@ -1,6 +1,11 @@
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 
+// OpenTelemetry imports
+import { SpanStatusCode } from '@opentelemetry/api';
+import { SeverityNumber } from '@opentelemetry/api-logs';
+import { logger, tracer } from './otel.js';
+
 import { isAdmin } from './account-db.js';
 import * as UserService from './services/user-service.js';
 import {
@@ -18,67 +23,210 @@ app.use(requestLoggerMiddleware);
 export { app as handlers };
 
 app.get('/owner-created/', (req, res) => {
+  const span = tracer.startSpan('admin.owner-created');
+
   try {
     const ownerCount = UserService.getOwnerCount();
-    res.json(ownerCount > 0);
+    const hasOwner = ownerCount > 0;
+
+    span.setAttributes({
+      'admin.owner_count': ownerCount,
+      'admin.has_owner': hasOwner,
+    });
+
+    logger.emit({
+      severityNumber: SeverityNumber.INFO,
+      severityText: 'INFO',
+      body: 'Owner status checked',
+      attributes: {
+        owner_count: ownerCount,
+        has_owner: hasOwner,
+      },
+    });
+
+    res.json(hasOwner);
+
+    span.setStatus({ code: SpanStatusCode.OK });
+    span.end();
   } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+    span.end();
+
+    logger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: 'Error checking owner status',
+      attributes: { error: error.message },
+    });
+
     res.status(500).json({ error: 'Failed to retrieve owner count' });
   }
 });
 
 app.get('/users/', validateSessionMiddleware, (req, res) => {
-  const users = UserService.getAllUsers();
-  res.json(
-    users.map(u => ({
-      ...u,
-      owner: u.owner === 1,
-      enabled: u.enabled === 1,
-    })),
-  );
+  const span = tracer.startSpan('admin.get-users');
+
+  try {
+    span.setAttributes({
+      'admin.requesting_user_id': res.locals.user_id,
+    });
+
+    const users = UserService.getAllUsers();
+    const userCount = users.length;
+
+    span.setAttributes({
+      'admin.users.count': userCount,
+    });
+
+    logger.emit({
+      severityNumber: SeverityNumber.INFO,
+      severityText: 'INFO',
+      body: 'Users list retrieved',
+      attributes: {
+        requesting_user_id: res.locals.user_id,
+        user_count: userCount,
+      },
+    });
+
+    res.json(
+      users.map(u => ({
+        ...u,
+        owner: u.owner === 1,
+        enabled: u.enabled === 1,
+      })),
+    );
+
+    span.setStatus({ code: SpanStatusCode.OK });
+    span.end();
+  } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+    span.end();
+
+    logger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: 'Error retrieving users list',
+      attributes: {
+        error: error.message,
+        requesting_user_id: res.locals.user_id,
+      },
+    });
+
+    throw error;
+  }
 });
 
 app.post('/users', validateSessionMiddleware, async (req, res) => {
-  if (!isAdmin(res.locals.user_id)) {
-    res.status(403).send({
-      status: 'error',
-      reason: 'forbidden',
-      details: 'permission-not-found',
-    });
-    return;
-  }
+  const span = tracer.startSpan('admin.create-user');
 
-  const { userName, role, displayName, enabled } = req.body || {};
-
-  if (!userName || !role) {
-    res.status(400).send({
-      status: 'error',
-      reason: `${!userName ? 'user-cant-be-empty' : 'role-cant-be-empty'}`,
-      details: `${!userName ? 'Username' : 'Role'} cannot be empty`,
+  try {
+    span.setAttributes({
+      'admin.requesting_user_id': res.locals.user_id,
     });
-    return;
-  }
 
-  const roleIdFromDb = UserService.validateRole(role);
-  if (!roleIdFromDb) {
-    res.status(400).send({
-      status: 'error',
-      reason: 'role-does-not-exists',
-      details: 'Selected role does not exist',
-    });
-    return;
-  }
+    if (!isAdmin(res.locals.user_id)) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'Forbidden - not admin' });
+      span.end();
 
-  const userIdInDb = UserService.getUserByUsername(userName);
-  if (userIdInDb) {
-    res.status(400).send({
-      status: 'error',
-      reason: 'user-already-exists',
-      details: `User ${userName} already exists`,
+      logger.emit({
+        severityNumber: SeverityNumber.WARN,
+        severityText: 'WARN',
+        body: 'User creation attempt by non-admin',
+        attributes: { requesting_user_id: res.locals.user_id },
+      });
+
+      res.status(403).send({
+        status: 'error',
+        reason: 'forbidden',
+        details: 'permission-not-found',
+      });
+      return;
+    }
+
+    const { userName, role, displayName, enabled } = req.body || {};
+
+    span.setAttributes({
+      'admin.new_user.username': userName,
+      'admin.new_user.role': role,
+      'admin.new_user.has_display_name': !!displayName,
+      'admin.new_user.enabled': enabled,
     });
-    return;
-  }
+
+    if (!userName || !role) {
+      const missingField = !userName ? 'username' : 'role';
+      span.setStatus({ code: SpanStatusCode.ERROR, message: `Missing ${missingField}` });
+      span.end();
+
+      logger.emit({
+        severityNumber: SeverityNumber.WARN,
+        severityText: 'WARN',
+        body: 'User creation failed - missing required field',
+        attributes: {
+          missing_field: missingField,
+          requesting_user_id: res.locals.user_id,
+        },
+      });
+
+      res.status(400).send({
+        status: 'error',
+        reason: `${!userName ? 'user-cant-be-empty' : 'role-cant-be-empty'}`,
+        details: `${!userName ? 'Username' : 'Role'} cannot be empty`,
+      });
+      return;
+    }
+
+    const roleIdFromDb = UserService.validateRole(role);
+    if (!roleIdFromDb) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'Invalid role' });
+      span.end();
+
+      logger.emit({
+        severityNumber: SeverityNumber.WARN,
+        severityText: 'WARN',
+        body: 'User creation failed - invalid role',
+        attributes: {
+          role,
+          requesting_user_id: res.locals.user_id,
+        },
+      });
+
+      res.status(400).send({
+        status: 'error',
+        reason: 'role-does-not-exists',
+        details: 'Selected role does not exist',
+      });
+      return;
+    }
+
+    const userIdInDb = UserService.getUserByUsername(userName);
+    if (userIdInDb) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'User already exists' });
+      span.end();
+
+      logger.emit({
+        severityNumber: SeverityNumber.WARN,
+        severityText: 'WARN',
+        body: 'User creation failed - user already exists',
+        attributes: {
+          username: userName,
+          requesting_user_id: res.locals.user_id,
+        },
+      });
+
+      res.status(400).send({
+        status: 'error',
+        reason: 'user-already-exists',
+        details: `User ${userName} already exists`,
+      });
+      return;
+    }
 
   const userId = uuidv4();
+
+  span.setAttributes({
+    'admin.new_user.id': userId,
+  });
+
   UserService.insertUser(
     userId,
     userName,
@@ -86,7 +234,38 @@ app.post('/users', validateSessionMiddleware, async (req, res) => {
     enabled ? 1 : 0,
   );
 
+  span.setStatus({ code: SpanStatusCode.OK });
+  span.end();
+
+  logger.emit({
+    severityNumber: SeverityNumber.INFO,
+    severityText: 'INFO',
+    body: 'User created successfully',
+    attributes: {
+      new_user_id: userId,
+      username: userName,
+      role,
+      requesting_user_id: res.locals.user_id,
+    },
+  });
+
   res.status(200).send({ status: 'ok', data: { id: userId } });
+  } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+    span.end();
+
+    logger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: 'Error creating user',
+      attributes: {
+        error: error.message,
+        requesting_user_id: res.locals.user_id,
+      },
+    });
+
+    throw error;
+  }
 });
 
 app.patch('/users', validateSessionMiddleware, async (req, res) => {
