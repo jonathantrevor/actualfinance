@@ -1,5 +1,10 @@
 import express from 'express';
 
+// OpenTelemetry imports
+import { SpanStatusCode } from '@opentelemetry/api';
+import { SeverityNumber } from '@opentelemetry/api-logs';
+import { logger, tracer } from './otel.js';
+
 import { disableOpenID, enableOpenID, isAdmin } from './account-db.js';
 import {
   isValidRedirectUrl,
@@ -20,22 +25,86 @@ app.use(requestLoggerMiddleware);
 export { app as handlers };
 
 app.post('/enable', validateSessionMiddleware, async (req, res) => {
-  if (!isAdmin(res.locals.user_id)) {
-    res.status(403).send({
-      status: 'error',
-      reason: 'forbidden',
-      details: 'permission-not-found',
+  const span = tracer.startSpan('openid.enable');
+
+  try {
+    span.setAttributes({
+      'openid.requesting_user_id': res.locals.user_id,
     });
-    return;
-  }
 
-  const { error } = (await enableOpenID(req.body)) || {};
+    if (!isAdmin(res.locals.user_id)) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: 'Forbidden - not admin' });
+      span.end();
 
-  if (error) {
-    res.status(500).send({ status: 'error', reason: error });
-    return;
+      logger.emit({
+        severityNumber: SeverityNumber.WARN,
+        severityText: 'WARN',
+        body: 'Non-admin user attempted to enable OpenID',
+        attributes: { user_id: res.locals.user_id },
+      });
+
+      res.status(403).send({
+        status: 'error',
+        reason: 'forbidden',
+        details: 'permission-not-found',
+      });
+      return;
+    }
+
+    logger.emit({
+      severityNumber: SeverityNumber.INFO,
+      severityText: 'INFO',
+      body: 'Enabling OpenID authentication',
+      attributes: { requesting_user_id: res.locals.user_id },
+    });
+
+    const { error } = (await enableOpenID(req.body)) || {};
+
+    if (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: error });
+      span.end();
+
+      logger.emit({
+        severityNumber: SeverityNumber.ERROR,
+        severityText: 'ERROR',
+        body: 'Failed to enable OpenID',
+        attributes: {
+          error,
+          requesting_user_id: res.locals.user_id,
+        },
+      });
+
+      res.status(500).send({ status: 'error', reason: error });
+      return;
+    }
+
+    span.setStatus({ code: SpanStatusCode.OK });
+    span.end();
+
+    logger.emit({
+      severityNumber: SeverityNumber.INFO,
+      severityText: 'INFO',
+      body: 'OpenID authentication enabled successfully',
+      attributes: { requesting_user_id: res.locals.user_id },
+    });
+
+    res.send({ status: 'ok' });
+  } catch (error) {
+    span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+    span.end();
+
+    logger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: 'Error enabling OpenID',
+      attributes: {
+        error: error.message,
+        requesting_user_id: res.locals.user_id,
+      },
+    });
+
+    throw error;
   }
-  res.send({ status: 'ok' });
 });
 
 app.post('/disable', validateSessionMiddleware, async (req, res) => {

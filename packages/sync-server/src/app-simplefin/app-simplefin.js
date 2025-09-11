@@ -2,6 +2,11 @@ import https from 'https';
 
 import express from 'express';
 
+// OpenTelemetry imports
+import { SpanStatusCode } from '@opentelemetry/api';
+import { SeverityNumber } from '@opentelemetry/api-logs';
+import { logger, tracer } from '../otel.js';
+
 import { handleError } from '../app-gocardless/util/handle-error.js';
 import { SecretName, secretsService } from '../services/secrets-service.js';
 import { requestLoggerMiddleware } from '../util/middlewares.js';
@@ -14,53 +19,154 @@ app.use(requestLoggerMiddleware);
 app.post(
   '/status',
   handleError(async (req, res) => {
-    const token = secretsService.get(SecretName.simplefin_token);
-    const configured = token != null && token !== 'Forbidden';
+    const span = tracer.startSpan('simplefin.status');
 
-    res.send({
-      status: 'ok',
-      data: {
-        configured,
-      },
-    });
+    try {
+      const token = secretsService.get(SecretName.simplefin_token);
+      const configured = token != null && token !== 'Forbidden';
+
+      span.setAttributes({
+        'simplefin.configured': configured,
+        'simplefin.has_token': !!token,
+      });
+
+      logger.emit({
+        severityNumber: SeverityNumber.INFO,
+        severityText: 'INFO',
+        body: 'SimpleFin status checked',
+        attributes: {
+          configured,
+          has_token: !!token,
+        },
+      });
+
+      res.send({
+        status: 'ok',
+        data: {
+          configured,
+        },
+      });
+
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+      span.end();
+
+      logger.emit({
+        severityNumber: SeverityNumber.ERROR,
+        severityText: 'ERROR',
+        body: 'Error checking SimpleFin status',
+        attributes: { error: error.message },
+      });
+
+      throw error;
+    }
   }),
 );
 
 app.post(
   '/accounts',
   handleError(async (req, res) => {
-    let accessKey = secretsService.get(SecretName.simplefin_accessKey);
+    const span = tracer.startSpan('simplefin.get-accounts');
 
     try {
-      if (accessKey == null || accessKey === 'Forbidden') {
-        const token = secretsService.get(SecretName.simplefin_token);
-        if (token == null || token === 'Forbidden') {
-          throw new Error('No token');
-        } else {
-          accessKey = await getAccessKey(token);
-          secretsService.set(SecretName.simplefin_accessKey, accessKey);
-          if (accessKey == null || accessKey === 'Forbidden') {
-            throw new Error('No access key');
+      let accessKey = secretsService.get(SecretName.simplefin_accessKey);
+
+      span.setAttributes({
+        'simplefin.has_access_key': !!accessKey && accessKey !== 'Forbidden',
+      });
+
+      try {
+        if (accessKey == null || accessKey === 'Forbidden') {
+          const token = secretsService.get(SecretName.simplefin_token);
+
+          span.setAttributes({
+            'simplefin.has_token': !!token && token !== 'Forbidden',
+          });
+
+          if (token == null || token === 'Forbidden') {
+            throw new Error('No token');
+          } else {
+            logger.emit({
+              severityNumber: SeverityNumber.INFO,
+              severityText: 'INFO',
+              body: 'Retrieving SimpleFin access key',
+            });
+
+            accessKey = await getAccessKey(token);
+            secretsService.set(SecretName.simplefin_accessKey, accessKey);
+            if (accessKey == null || accessKey === 'Forbidden') {
+              throw new Error('No access key');
+            }
           }
         }
+      } catch (error) {
+        span.setStatus({ code: SpanStatusCode.ERROR, message: 'Invalid token' });
+        span.end();
+
+        logger.emit({
+          severityNumber: SeverityNumber.ERROR,
+          severityText: 'ERROR',
+          body: 'SimpleFin token validation failed',
+          attributes: { error: error.message },
+        });
+
+        invalidToken(res);
+        return;
       }
-    } catch {
-      invalidToken(res);
-      return;
-    }
 
-    try {
-      const accounts = await getAccounts(accessKey, null, null, null, true);
+      try {
+        const accounts = await getAccounts(accessKey, null, null, null, true);
 
-      res.send({
-        status: 'ok',
-        data: {
-          accounts: accounts.accounts,
-        },
+        span.setAttributes({
+          'simplefin.accounts.count': accounts.accounts?.length || 0,
+        });
+
+        logger.emit({
+          severityNumber: SeverityNumber.INFO,
+          severityText: 'INFO',
+          body: 'SimpleFin accounts retrieved successfully',
+          attributes: {
+            account_count: accounts.accounts?.length || 0,
+          },
+        });
+
+        res.send({
+          status: 'ok',
+          data: {
+            accounts: accounts.accounts,
+          },
+        });
+
+        span.setStatus({ code: SpanStatusCode.OK });
+        span.end();
+      } catch (e) {
+        span.setStatus({ code: SpanStatusCode.ERROR, message: e.message });
+        span.end();
+
+        logger.emit({
+          severityNumber: SeverityNumber.ERROR,
+          severityText: 'ERROR',
+          body: 'SimpleFin server error',
+          attributes: { error: e.message },
+        });
+
+        serverDown(e, res);
+        return;
+      }
+    } catch (error) {
+      span.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
+      span.end();
+
+      logger.emit({
+        severityNumber: SeverityNumber.ERROR,
+        severityText: 'ERROR',
+        body: 'Error in SimpleFin accounts endpoint',
+        attributes: { error: error.message },
       });
-    } catch (e) {
-      serverDown(e, res);
-      return;
+
+      throw error;
     }
   }),
 );
